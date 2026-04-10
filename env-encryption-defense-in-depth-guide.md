@@ -22,12 +22,13 @@
 ## 目次
 
 1. [Layer 1: 暗号化 — dotenvx と SOPS](#layer-1-暗号化)
-2. [Layer 2: 鍵の隔離 — 秘密鍵をファイルに置かない](#layer-2-鍵の隔離)
-3. [Layer 3: アクセス制御 — OS レベルの防御](#layer-3-アクセス制御)
-4. [Layer 4: 検知・監視](#layer-4-検知監視)
-5. [Python 実装例（多層防御統合）](#python-実装例)
-6. [脅威シナリオ別の防御マッピング](#脅威シナリオ別の防御マッピング)
-7. [クイックリファレンス](#クイックリファレンス)
+2. [複数環境の .env 管理](#複数環境の-env-管理)
+3. [Layer 2: 鍵の隔離 — 秘密鍵をファイルに置かない](#layer-2-鍵の隔離)
+4. [Layer 3: アクセス制御 — OS レベルの防御](#layer-3-アクセス制御)
+5. [Layer 4: 検知・監視](#layer-4-検知監視)
+6. [Python 実装例（多層防御統合）](#python-実装例)
+7. [脅威シナリオ別の防御マッピング](#脅威シナリオ別の防御マッピング)
+8. [クイックリファレンス](#クイックリファレンス)
 
 ---
 
@@ -106,6 +107,296 @@ creation_rules:
 
 **⚠️ SOPS + age の限界**: `~/.config/sops/age/keys.txt` がローカルファイル。
 → 同様に Layer 2 で対策する。
+
+---
+
+## 複数環境の .env 管理
+
+プロジェクトが development / staging / production と環境を持つと、
+`.env` ファイルが急速に増殖する。暗号化と組み合わせるとさらにファイルが増えるため、
+**命名規約・ディレクトリ構造・鍵の分離** を最初に決めておくことが重要。
+
+### ファイル命名規約
+
+```
+.env                     ← 共通（シークレットを含まない設定値のみ）
+.env.development         ← 開発環境のシークレット
+.env.staging             ← ステージング
+.env.production          ← 本番
+.env.test                ← テスト用（CI）
+.env.local               ← 個人のローカル上書き（Git管理外）
+```
+
+暗号化後：
+
+```
+# dotenvx の場合 — .env 自体が暗号化される（ファイル名は変わらない）
+.env.development         ← 中身が暗号化済み
+.env.staging
+.env.production
+.env.keys                ← 全環境の秘密鍵がまとめて入る
+
+# SOPS の場合 — .enc サフィックスを付けて平文と区別
+.env.development.enc     ← 暗号化済み
+.env.staging.enc
+.env.production.enc
+.env.development         ← .gitignore（平文は Git 管理外）
+```
+
+### ディレクトリ構造パターン
+
+小規模プロジェクトではルート直置きで十分だが、
+環境が増えたり複数サービスを持つモノレポでは `envs/` ディレクトリに集約する：
+
+```
+project/
+├── envs/
+│   ├── .env.shared              ← 全環境共通（非シークレット: LOG_LEVEL, APP_NAME 等）
+│   ├── .env.development.enc     ← SOPS 暗号化
+│   ├── .env.staging.enc
+│   ├── .env.production.enc
+│   └── .env.local               ← 個人上書き（.gitignore）
+├── .sops.yaml                   ← SOPS 設定（環境別の鍵ルールを定義）
+├── .gitignore
+├── src/
+│   └── config.py
+└── ...
+```
+
+**モノレポの場合**（複数サービス）:
+
+```
+monorepo/
+├── envs/
+│   ├── api/
+│   │   ├── .env.development.enc
+│   │   ├── .env.staging.enc
+│   │   └── .env.production.enc
+│   ├── worker/
+│   │   ├── .env.development.enc
+│   │   └── .env.production.enc
+│   └── shared/
+│       └── .env.shared
+├── .sops.yaml
+└── ...
+```
+
+### .gitignore テンプレート
+
+```gitignore
+# ===== .env 管理ルール =====
+
+# 平文は全て Git 管理外
+.env
+.env.local
+.env.development
+.env.staging
+.env.production
+.env.test
+envs/**/.env.*
+!envs/**/.env.*.enc      # 暗号化済みは許可
+!envs/**/.env.shared     # 共通の非シークレットは許可
+
+# dotenvx 秘密鍵
+.env.keys
+
+# SOPS 暗号化済みは Git 管理する
+# .env.*.enc → ✅ コミット OK
+
+# 一時的な復号ファイル
+*.decrypted
+*.tmp.env
+```
+
+### 環境別の鍵分離（SOPS）
+
+**重要**: 全環境で同じ鍵を使うと、開発者が本番シークレットも復号できてしまう。
+環境ごとに鍵を分離し、アクセスできる人を制限する。
+
+```yaml
+# .sops.yaml — 環境別に異なる鍵を割り当て
+creation_rules:
+  # 開発: 全開発者がアクセス可能な age 鍵
+  - path_regex: \.env\.development\.enc$
+    age: >-
+      age1dev_public_key_here
+
+  # ステージング: リード + インフラチームのみ
+  - path_regex: \.env\.staging\.enc$
+    age: >-
+      age1staging_public_key_here
+
+  # 本番: KMS のみ（age 鍵なし → ローカルでは復号不可）
+  - path_regex: \.env\.production\.enc$
+    kms: arn:aws:kms:ap-northeast-1:123456789:key/prod-key-id
+
+  # Terraform secrets（既存運用と統一）
+  - path_regex: \.tfvars\.json$
+    kms: arn:aws:kms:ap-northeast-1:123456789:key/prod-key-id
+```
+
+この構成の意味：
+
+| 環境 | 鍵 | 復号できる人 |
+|------|-----|------------|
+| development | age（開発チーム共有） | 全開発者 |
+| staging | age（リードのみ共有） | リードエンジニア + インフラ |
+| production | AWS KMS | KMS Decrypt 権限を持つ IAM ロールのみ |
+
+### dotenvx の環境別鍵管理
+
+dotenvx は `dotenvx encrypt` 実行時に環境ごとの鍵ペアを自動生成し、
+`.env.keys` にまとめて記録する：
+
+```ini
+# .env.keys（dotenvx が自動生成）
+DOTENV_PRIVATE_KEY_DEVELOPMENT="ec9f..."
+DOTENV_PRIVATE_KEY_STAGING="a3b1..."
+DOTENV_PRIVATE_KEY_PRODUCTION="7d2e..."
+```
+
+**環境別に鍵を分離配布する運用**:
+
+```bash
+# 本番鍵だけ抽出して Secrets Manager に格納
+grep "PRODUCTION" .env.keys | cut -d'=' -f2 | \
+  aws secretsmanager create-secret \
+    --name "myapp/dotenvx-production-key" \
+    --secret-string "$(cat -)"
+
+# 開発鍵はチームのパスワードマネージャへ
+grep "DEVELOPMENT" .env.keys
+# → 1Password / Bitwarden の共有 Vault に保存
+
+# ステージング鍵はリードのみアクセスできる Vault へ
+grep "STAGING" .env.keys
+# → 限定メンバーの Vault に保存
+```
+
+### 共通変数と環境固有変数の分離
+
+シークレットでない設定値（ログレベル、アプリ名、機能フラグ等）は
+`.env.shared` に分離し、暗号化対象から外す：
+
+```ini
+# envs/.env.shared（Git 管理、暗号化不要）
+APP_NAME=myapp
+LOG_FORMAT=json
+ENABLE_FEATURE_X=true
+```
+
+```ini
+# envs/.env.production.enc（暗号化対象はシークレットのみ）
+DATABASE_URL=encrypted:xxxx
+API_KEY=encrypted:yyyy
+AWS_SECRET_ACCESS_KEY=encrypted:zzzz
+```
+
+Python での読み込み順:
+
+```python
+# 1. 共通設定をロード
+# 2. 環境固有のシークレットで上書き
+# → 重複を減らし、暗号化対象を最小化
+```
+
+### 環境の一覧管理と整合性チェック
+
+環境が増えると「staging に変数を追加し忘れた」といった事故が起きる。
+キー名の一覧を突き合わせるスクリプトを用意する:
+
+```bash
+#!/bin/bash
+# scripts/check-env-consistency.sh
+# 全環境の .env で同じキーが定義されているか確認する
+
+ENVS=("development" "staging" "production")
+REFERENCE="development"
+
+# 基準環境のキー一覧
+ref_keys=$(sops --decrypt --input-type dotenv --output-type dotenv \
+  "envs/.env.${REFERENCE}.enc" 2>/dev/null | grep -v '^#' | cut -d= -f1 | sort)
+
+for env in "${ENVS[@]}"; do
+  if [ "$env" = "$REFERENCE" ]; then continue; fi
+
+  env_keys=$(sops --decrypt --input-type dotenv --output-type dotenv \
+    "envs/.env.${env}.enc" 2>/dev/null | grep -v '^#' | cut -d= -f1 | sort)
+
+  missing=$(comm -23 <(echo "$ref_keys") <(echo "$env_keys"))
+  extra=$(comm -13 <(echo "$ref_keys") <(echo "$env_keys"))
+
+  if [ -n "$missing" ]; then
+    echo "⚠️  ${env} に不足しているキー:"
+    echo "$missing" | sed 's/^/   /'
+  fi
+
+  if [ -n "$extra" ]; then
+    echo "ℹ️  ${env} にのみ存在するキー:"
+    echo "$extra" | sed 's/^/   /'
+  fi
+
+  if [ -z "$missing" ] && [ -z "$extra" ]; then
+    echo "✅ ${env}: ${REFERENCE} と一致"
+  fi
+done
+```
+
+```bash
+# CI でも実行（GitHub Actions 例）
+- name: Check .env consistency
+  run: bash scripts/check-env-consistency.sh
+```
+
+### Makefile / タスクランナーによる操作の統一
+
+環境が増えると `sops --decrypt --input-type dotenv --output-type dotenv envs/.env.staging.enc`
+のような長いコマンドを毎回打つのは非現実的。Makefile でラップする：
+
+```makefile
+# Makefile
+ENV ?= development
+
+# 暗号化
+env-encrypt:
+	sops --encrypt --input-type dotenv --output-type dotenv \
+		envs/.env.$(ENV) > envs/.env.$(ENV).enc
+	@echo "✅ envs/.env.$(ENV).enc を更新しました"
+	@rm -f envs/.env.$(ENV)
+	@echo "🗑️  平文 envs/.env.$(ENV) を削除しました"
+
+# 復号して編集
+env-edit:
+	sops --input-type dotenv --output-type dotenv envs/.env.$(ENV).enc
+
+# 復号してアプリ起動
+run:
+	@sops --decrypt --input-type dotenv --output-type dotenv \
+		envs/.env.$(ENV).enc > /tmp/.env.$(ENV).tmp
+	@cat envs/.env.shared /tmp/.env.$(ENV).tmp > /tmp/.env.merged
+	@rm /tmp/.env.$(ENV).tmp
+	APP_ENV=$(ENV) dotenvx run -f /tmp/.env.merged -- python src/app.py
+	@rm -f /tmp/.env.merged
+
+# 環境間のキー整合性チェック
+env-check:
+	@bash scripts/check-env-consistency.sh
+
+# 全環境の鍵ローテーション
+env-rotate:
+	@for enc in envs/.env.*.enc; do \
+		sops --rotate --input-type dotenv --output-type dotenv -i "$$enc"; \
+		echo "🔄 $$enc のデータキーをローテーションしました"; \
+	done
+```
+
+```bash
+# 使い方
+make env-edit ENV=staging       # ステージングのシークレットを編集
+make run ENV=production         # 本番設定でアプリ起動
+make env-check                  # 全環境のキー整合性チェック
+make env-rotate                 # 全環境の鍵ローテーション
+```
 
 ---
 
@@ -641,46 +932,143 @@ if __name__ == "__main__":
     print(f"DB: {settings.database_url}")
 ```
 
-### パターン4: 環境に応じた自動切り替え
+### パターン4: 複数環境の自動切り替え（envs/ ディレクトリ対応）
 
 ```python
 # config.py
 """
-APP_ENV に応じて最適なシークレット取得方式を自動選択。
+APP_ENV に応じてシークレット取得方式と対象ファイルを自動選択。
+envs/ ディレクトリ構造に対応し、共通設定とシークレットをマージする。
 
-  development  → dotenvx + OS Keychain
-  staging      → SOPS + age (Keychain)
+  development  → SOPS + age (OS Keychain)
+  staging      → SOPS + age (Keychain、リード限定鍵)
   production   → AWS Secrets Manager（.env ファイル不要）
+  test         → SOPS + age（CI 用）
 """
 import os
+from pathlib import Path
 
 APP_ENV = os.getenv("APP_ENV", "development")
+BASE_DIR = Path(__file__).resolve().parent
+ENVS_DIR = BASE_DIR / "envs"
+
+
+def _load_shared():
+    """共通の非シークレット設定（.env.shared）をロード"""
+    shared_path = ENVS_DIR / ".env.shared"
+    if shared_path.exists():
+        from dotenv import load_dotenv
+        load_dotenv(shared_path, override=False)
+
+
+def _load_local_override():
+    """個人のローカル上書き（.env.local）を最優先でロード"""
+    local_path = ENVS_DIR / ".env.local"
+    if local_path.exists():
+        from dotenv import load_dotenv
+        load_dotenv(local_path, override=True)
 
 
 def load_config():
+    """
+    読み込み順序（後勝ち）:
+    1. envs/.env.shared         — 共通の非シークレット
+    2. 環境固有のシークレット     — 方式は環境による
+    3. envs/.env.local          — 個人上書き（開発時のみ）
+    """
+    # Step 1: 共通設定
+    _load_shared()
+
+    # Step 2: 環境固有のシークレット
     if APP_ENV == "production":
-        # 本番: ファイルシステムにシークレットを置かない
         from config_aws import load_secrets_from_aws
         load_secrets_from_aws("myapp/env/production")
 
-    elif APP_ENV == "staging":
-        # ステージング: SOPS + KMS（鍵ファイル不要）
+    elif APP_ENV in ("staging", "development", "test"):
+        enc_file = ENVS_DIR / f".env.{APP_ENV}.enc"
+        if not enc_file.exists():
+            raise FileNotFoundError(f"{enc_file} が見つかりません")
+
         from config_sops import load_sops_env
-        load_sops_env(".env.staging.enc", use_keychain=False)
-        # ↑ KMS 利用時は use_keychain=False（IAMロールで認証）
+
+        if APP_ENV == "staging":
+            # KMS 利用（IAMロール認証、鍵ファイル不要）
+            load_sops_env(str(enc_file), use_keychain=False)
+        else:
+            # 開発/テスト: OS Keychain の age 鍵を使用
+            load_sops_env(str(enc_file), use_keychain=True)
 
     else:
-        # 開発: dotenvx + OS Keychain
-        try:
-            from config_dotenvx import load_dotenvx_secure
-            load_dotenvx_secure()
-        except Exception:
-            # フォールバック: python-dotenv
-            from dotenv import load_dotenv
-            load_dotenv()
+        raise ValueError(f"Unknown APP_ENV: {APP_ENV}")
+
+    # Step 3: ローカル上書き（開発時のみ）
+    if APP_ENV == "development":
+        _load_local_override()
 
 
 load_config()
+```
+
+### パターン5: 環境間の整合性バリデーション（Python版）
+
+```python
+# scripts/validate_envs.py
+"""
+全環境の .env.enc に同じキーが定義されているか検証する。
+CI で実行して、変数の追加漏れを検知する。
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+
+ENVS_DIR = Path("envs")
+ENVIRONMENTS = ["development", "staging", "production"]
+REFERENCE = "development"
+
+
+def get_keys(env: str) -> set[str]:
+    enc_file = ENVS_DIR / f".env.{env}.enc"
+    result = subprocess.run(
+        ["sops", "--decrypt", "--input-type", "dotenv",
+         "--output-type", "dotenv", str(enc_file)],
+        capture_output=True, text=True, check=True,
+    )
+    keys = set()
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, _, _ = line.partition("=")
+            keys.add(key.strip())
+    return keys
+
+
+def main():
+    ref_keys = get_keys(REFERENCE)
+    has_error = False
+
+    for env in ENVIRONMENTS:
+        if env == REFERENCE:
+            continue
+        env_keys = get_keys(env)
+
+        missing = ref_keys - env_keys
+        extra = env_keys - ref_keys
+
+        if missing:
+            print(f"⚠️  {env} に不足: {', '.join(sorted(missing))}")
+            has_error = True
+        if extra:
+            print(f"ℹ️  {env} にのみ存在: {', '.join(sorted(extra))}")
+
+        if not missing and not extra:
+            print(f"✅ {env}: {REFERENCE} と一致")
+
+    sys.exit(1 if has_error else 0)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
